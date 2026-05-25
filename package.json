@@ -1,0 +1,51 @@
+{
+  "name": "ooredoo-reseller-api",
+  "version": "1.0.0",
+  "description": "REST API — Ooredoo authorized reseller inventory & sales system",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "seed:admin": "node scripts/seed-admin.js",
+    "migrate": "node-pg-migrate -d DATABASE_URL",
+    "migrate:up": "node-pg-migrate -d DATABASE_URL up",
+    "migrate:down": "node-pg-migrate -d DATABASE_URL down",
+    "migrate:create": "node-pg-migrate -d DATABASE_URL create",
+    "test": "jest --runInBand --coverage",
+    "test:watch": "jest --watch",
+    "test:integration": "vitest run --config vitest.config.js"
+  },
+  "dependencies": {
+    "@sentry/node": "^10.52.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.12.0",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0"
+  },
+  "devDependencies": {
+    "fast-check": "^4.8.0",
+    "jest": "^29.7.0",
+    "node-pg-migrate": "^8.0.4",
+    "nodemon": "^3.1.4",
+    "supertest": "^7.0.0",
+    "vitest": "^4.1.7"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/__tests__/**/*.test.js"
+    ],
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "src/**/*.js"
+    ]
+  }
+}

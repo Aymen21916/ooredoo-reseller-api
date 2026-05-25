@@ -1,0 +1,7 @@
+node_modules
+.env
+coverage
+ooredoo-pos-client/node_modules
+ooredoo-pos-client/dist
+*.log
+.git

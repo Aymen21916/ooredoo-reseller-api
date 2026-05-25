@@ -1,0 +1,198 @@
+
+<style>
+#erd svg { max-width: 100%; }
+#erd svg .entityBox { rx: 8; }
+.er.relationshipLine { stroke: var(--color-border-secondary); }
+</style>
+<div id="erd" style="padding:8px 0; overflow-x:auto;"></div>
+<script type="module">
+import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+await document.fonts.ready;
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'base',
+  fontFamily: '"Anthropic Sans", sans-serif',
+  themeVariables: {
+    darkMode: dark,
+    fontSize: '12px',
+    fontFamily: '"Anthropic Sans", sans-serif',
+    lineColor: dark ? '#9c9a92' : '#73726c',
+    textColor: dark ? '#c2c0b6' : '#3d3d3a',
+    primaryColor: dark ? '#3C3489' : '#EEEDFE',
+    primaryBorderColor: dark ? '#7F77DD' : '#AFA9EC',
+    primaryTextColor: dark ? '#CECBF6' : '#26215C',
+    secondaryColor: dark ? '#085041' : '#E1F5EE',
+    secondaryBorderColor: dark ? '#1D9E75' : '#5DCAA5',
+    secondaryTextColor: dark ? '#9FE1CB' : '#04342C',
+    tertiaryColor: dark ? '#3C3489' : '#FAEEDA',
+    tertiaryBorderColor: dark ? '#BA7517' : '#EF9F27',
+    tertiaryTextColor: dark ? '#FAC775' : '#412402',
+    edgeLabelBackground: dark ? '#2C2C2A' : '#F1EFE8',
+  },
+  er: { diagramPadding: 20, layoutDirection: 'TB', minEntityWidth: 100, minEntityHeight: 75, entityPadding: 15, useMaxWidth: true }
+});
+const diagram = `erDiagram
+  stores {
+    serial id PK
+    varchar name
+    varchar location
+  }
+  users {
+    serial id PK
+    varchar username
+    enum role
+    int store_id FK
+    bool is_active
+  }
+  offers {
+    serial id PK
+    varchar name
+    numeric real_price
+    numeric selling_price
+    int points
+    numeric commission_amount
+    bool is_active
+  }
+  product_categories {
+    serial id PK
+    varchar name
+  }
+  products {
+    serial id PK
+    varchar name
+    numeric price
+    int category_id FK
+    numeric commission_amount
+    bool is_active
+  }
+  cashier_sessions {
+    serial id PK
+    int cashier_id FK
+    int store_id FK
+    date session_date
+    enum status
+    numeric opening_cash
+    timestamptz closed_at
+  }
+  sim_stock_assignments {
+    serial id PK
+    int session_id FK
+    int offer_id FK
+    int assigned_quantity
+    int assigned_by FK
+  }
+  session_sim_sales {
+    serial id PK
+    int session_id FK
+    int offer_id FK
+    numeric selling_price_snapshot
+    numeric real_price_snapshot
+    numeric commission_snapshot
+    int points_snapshot
+    bool is_voided
+  }
+  session_storm_entries {
+    serial id PK
+    int session_id FK
+    numeric amount
+    bool is_voided
+  }
+  session_accessory_sales {
+    serial id PK
+    int session_id FK
+    int product_id FK
+    varchar product_name_snapshot
+    numeric price_snapshot
+    numeric commission_snapshot
+    bool is_voided
+  }
+  session_debts {
+    serial id PK
+    int session_id FK
+    numeric amount
+    text description
+    bool is_voided
+  }
+  global_pool_state {
+    serial id PK
+    numeric available_balance
+    numeric available_bonus
+    int available_points
+    int updated_by FK
+    timestamptz updated_at
+  }
+  store_register_state {
+    serial id PK
+    int store_id FK
+    numeric cash_amount
+    int updated_by FK
+  }
+  daily_reports {
+    serial id PK
+    date report_date
+    int store_id FK
+    jsonb snapshot
+    numeric total_selling_price
+    numeric total_commissions
+  }
+  audit_logs {
+    bigserial id PK
+    int user_id FK
+    enum action
+    varchar table_name
+    jsonb old_values
+    jsonb new_values
+  }
+  refresh_tokens {
+    serial id PK
+    int user_id FK
+    text token_hash
+    timestamptz expires_at
+    bool is_revoked
+  }
+
+  stores ||--o{ users : "employs"
+  stores ||--o{ cashier_sessions : "hosts"
+  stores ||--o{ store_register_state : "has cash"
+  stores ||--o{ daily_reports : "archives"
+  users ||--o{ cashier_sessions : "opens"
+  users ||--o{ audit_logs : "generates"
+  users ||--o{ global_pool_state : "updates"
+  users ||--o{ store_register_state : "updates"
+  users ||--o{ refresh_tokens : "holds"
+  cashier_sessions ||--o{ sim_stock_assignments : "receives"
+  cashier_sessions ||--o{ session_sim_sales : "contains"
+  cashier_sessions ||--o{ session_storm_entries : "contains"
+  cashier_sessions ||--o{ session_accessory_sales : "contains"
+  cashier_sessions ||--o{ session_debts : "tracks"
+  offers ||--o{ sim_stock_assignments : "allocated via"
+  offers ||--o{ session_sim_sales : "sold as"
+  product_categories ||--o{ products : "groups"
+  products ||--o{ session_accessory_sales : "sold as"
+`;
+const { svg } = await mermaid.render('erd-svg', diagram);
+document.getElementById('erd').innerHTML = svg;
+document.querySelectorAll('#erd svg .node').forEach(node => {
+  const firstPath = node.querySelector('path[d]');
+  if (!firstPath) return;
+  const d = firstPath.getAttribute('d');
+  const nums = d.match(/-?[\d.]+/g)?.map(Number);
+  if (!nums || nums.length < 8) return;
+  const xs = [nums[0], nums[2], nums[4], nums[6]];
+  const ys = [nums[1], nums[3], nums[5], nums[7]];
+  const x = Math.min(...xs), y = Math.min(...ys);
+  const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', x); rect.setAttribute('y', y);
+  rect.setAttribute('width', w); rect.setAttribute('height', h);
+  rect.setAttribute('rx', '8');
+  for (const a of ['fill', 'stroke', 'stroke-width', 'class', 'style']) {
+    if (firstPath.hasAttribute(a)) rect.setAttribute(a, firstPath.getAttribute(a));
+  }
+  firstPath.replaceWith(rect);
+});
+document.querySelectorAll('#erd svg .row-rect-odd path, #erd svg .row-rect-even path').forEach(p => {
+  p.setAttribute('stroke', 'none');
+});
+</script>
