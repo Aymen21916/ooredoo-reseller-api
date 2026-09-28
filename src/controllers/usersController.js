@@ -124,6 +124,9 @@ const updateUser = asyncHandler(async (req, res) => {
   if (req.body.full_name !== undefined) {
     updates.full_name = parseString(req.body.full_name, 'full_name', 100);
   }
+  if (req.body.username !== undefined) {
+    updates.username = parseString(req.body.username, 'username', 50).toLowerCase();
+  }
   if (req.body.is_active !== undefined) {
     updates.is_active = Boolean(req.body.is_active);
   }
@@ -153,7 +156,7 @@ const updateUser = asyncHandler(async (req, res) => {
     action:    'UPDATE',
     table:     'users',
     recordId:  id,
-    oldValues: { full_name: prev.full_name, is_active: prev.is_active, store_id: prev.store_id },
+    oldValues: { username: prev.username, full_name: prev.full_name, is_active: prev.is_active, store_id: prev.store_id },
     newValues: updates,
     ip:        req.clientIp,
   });

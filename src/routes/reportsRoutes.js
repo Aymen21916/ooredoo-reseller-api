@@ -22,10 +22,21 @@ router.use(rangeRouter);
 // Every other `/api/reports/*` endpoint stays admin-only.
 const adminRouter = express.Router();
 adminRouter.use(authenticate, authorize('admin'));
-adminRouter.get('/preview',   reportsController.previewDailyReport);
-adminRouter.post('/generate', reportsController.generateDailyReport);
-adminRouter.get('/',          reportsController.getReports);
-adminRouter.get('/:id',       reportsController.getReportById);
+
+// Static paths declared FIRST so they win against the parameterised
+// `/:id` and `/:id/export.csv` routes below.
+adminRouter.get('/preview',     reportsController.previewDailyReport);
+adminRouter.post('/generate',   reportsController.generateDailyReport);
+adminRouter.get('/monthly',     reportsController.getMonthlySummary);
+adminRouter.get('/top',         reportsController.getTopRollup);
+adminRouter.get('/audit',       reportsController.getAuditLog);
+adminRouter.get('/cashier/:id', reportsController.getCashierHistory);
+
+// Report-id-scoped paths (most specific first)
+adminRouter.get('/:id/export.csv', reportsController.exportReportCsv);
+
+adminRouter.get('/',     reportsController.getReports);
+adminRouter.get('/:id',  reportsController.getReportById);
 router.use(adminRouter);
 
 module.exports = router;

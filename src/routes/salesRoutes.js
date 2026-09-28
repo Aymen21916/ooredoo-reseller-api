@@ -13,10 +13,14 @@ router.use(authenticate);
 // Only cashiers can record active sales. Admins don't ring up customers.
 router.use(authorize('cashier'));
 
+router.get('/history/:sessionId', salesController.getSessionHistory);
 router.post('/sim', salesController.recordSimSale);
 router.post('/storm', salesController.recordStormEntry);
 router.post('/accessory', salesController.recordAccessorySale);
 router.post('/debt', salesController.recordDebt);
 router.post('/:type/:id/void', salesController.voidTransaction);
+
+// ─── Ooredoo USSD Proxy Route ────────────────────────────────────────────────
+router.post('/proxy/nbservice', salesController.proxyNbservice);
 
 module.exports = router;

@@ -6,9 +6,6 @@ const { asyncHandler, sendSuccess, sendCreated } = require('../utils/asyncHandle
 const { audit }  = require('../utils/audit');
 const { parseId, parsePositiveInt, parseDate } = require('../utils/validators');
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Resolve session and assert cashier ownership (or admin access). */
 const resolveSession = async (sessionId, req, client) => {
   const db_ = client || db;
   const { rows } = await db_.query(
@@ -27,17 +24,13 @@ const resolveSession = async (sessionId, req, client) => {
   return session;
 };
 
-// ─── POST /api/sessions  — open a new session ───────────────────────────────
-
 const openSession = asyncHandler(async (req, res) => {
-  // Cashiers open their own; admin may open on behalf of a cashier
   const cashierId = req.user.role === 'admin'
     ? parseInt(req.body.cashier_id, 10)
     : req.user.id;
 
   if (!cashierId) throw AppError.badRequest('cashier_id is required.', 'VALIDATION_ERROR');
 
-  // Verify cashier exists and belongs to a store
   const { rows: userRows } = await db.query(
     `SELECT id, store_id, role FROM users WHERE id = $1 AND is_active = TRUE`,
     [cashierId]
@@ -47,13 +40,8 @@ const openSession = asyncHandler(async (req, res) => {
 
   const storeId = userRows[0].store_id;
 
-  // Fetch current register cash for the opening_cash snapshot
-  const { rows: regRows } = await db.query(
-    `SELECT cash_amount FROM store_register_state
-     WHERE store_id = $1 ORDER BY id DESC LIMIT 1`,
-    [storeId]
-  );
-  const openingCash = regRows[0]?.cash_amount ?? 0;
+  // STRICT OVERRIDE: Every cashier starts their register completely empty at 0 DZD.
+  const openingCash = 0;
 
   const { rows } = await db.query(
     `INSERT INTO cashier_sessions (cashier_id, store_id, opening_cash)
@@ -64,7 +52,6 @@ const openSession = asyncHandler(async (req, res) => {
   );
 
   if (!rows[0]) {
-    // Conflict — session already exists today
     const { rows: existing } = await db.query(
       `SELECT * FROM cashier_sessions
        WHERE cashier_id = $1 AND session_date = CURRENT_DATE`,
@@ -87,9 +74,6 @@ const openSession = asyncHandler(async (req, res) => {
 
   sendCreated(res, rows[0], 'Session opened.');
 });
-
-// ─── GET /api/sessions  ──────────────────────────────────────────────────────
-// Admin: all sessions (filterable). Cashier: own sessions only.
 
 const listSessions = asyncHandler(async (req, res) => {
   const params = [];
@@ -133,19 +117,15 @@ const listSessions = asyncHandler(async (req, res) => {
   sendSuccess(res, rows);
 });
 
-// ─── GET /api/sessions/:id  ──────────────────────────────────────────────────
-
 const getSession = asyncHandler(async (req, res) => {
   const id      = parseId(req.params.id);
   const session = await resolveSession(id, req);
   sendSuccess(res, session);
 });
 
-// ─── GET /api/sessions/:id/totals  — live calculated totals ─────────────────
-
 const getSessionTotals = asyncHandler(async (req, res) => {
   const id = parseId(req.params.id);
-  await resolveSession(id, req); // ownership check
+  await resolveSession(id, req); 
 
   const { rows } = await db.withRLS(req.user.id, req.user.role, (client) =>
     client.query(
@@ -156,10 +136,7 @@ const getSessionTotals = asyncHandler(async (req, res) => {
   sendSuccess(res, rows[0]);
 });
 
-// ─── GET /api/sessions/live  — all open sessions (admin dashboard) ──────────
-
 const getLiveSessions = asyncHandler(async (req, res) => {
-  // Admin only — returns live totals for all open sessions across both stores
   const params = [];
   let storeFilter = '';
 
@@ -180,38 +157,30 @@ const getLiveSessions = asyncHandler(async (req, res) => {
   sendSuccess(res, rows);
 });
 
-// ─── POST /api/sessions/:id/close  ──────────────────────────────────────────
-
 const closeSession = asyncHandler(async (req, res) => {
-  const id      = parseId(req.params.id);
-  const session = await resolveSession(id, req);
+  const id = parseId(req.params.id);
+  
+  const manualCash = req.body.closing_cash !== undefined ? parseFloat(req.body.closing_cash) : null;
+  
+  const { rows: sessionRows } = await db.query(`SELECT * FROM cashier_sessions WHERE id = $1`, [id]);
+  if (!sessionRows[0]) throw AppError.notFound('Session not found.');
+  if (sessionRows[0].status === 'closed') throw AppError.badRequest('Session already closed.');
 
-  if (session.status === 'closed') {
-    throw AppError.conflict('Session is already closed.', 'SESSION_ALREADY_CLOSED');
-  }
+  const { rows: totalsRows } = await db.query(`SELECT expected_register_cash FROM v_session_live_totals WHERE session_id = $1`, [id]);
+  const expectedCash = totalsRows[0] ? parseFloat(totalsRows[0].expected_register_cash) : 0;
+  
+  const discrepancy = manualCash !== null ? manualCash - expectedCash : null;
 
   const { rows } = await db.query(
-    `UPDATE cashier_sessions
-     SET status = 'closed', closed_at = NOW()
-     WHERE id = $1
-     RETURNING *`,
-    [id]
+    `UPDATE cashier_sessions 
+     SET status = 'closed', closed_at = NOW(), closing_cash = $1, cash_discrepancy = $2 
+     WHERE id = $3 RETURNING *`,
+    [manualCash, discrepancy, id]
   );
-
-  audit({
-    userId:    req.user.id,
-    action:    'SESSION_CLOSE',
-    table:     'cashier_sessions',
-    recordId:  id,
-    ip:        req.clientIp,
-  });
-
-  sendSuccess(res, rows[0], 200, 'Session closed.');
+  
+  audit({ userId: req.user.id, action: 'SESSION_CLOSE', table: 'cashier_sessions', recordId: id, ip: req.clientIp });
+  sendSuccess(res, rows[0], 200, 'Session closed and cash recorded.');
 });
-
-// ─── POST /api/sessions/:id/stock-assign  (DEPRECATED) ──────────────────────
-// Stock is now assigned per-cashier via POST /api/stock/assign — kept here as
-// a stub returning 410 Gone so existing clients fail fast with a clear message.
 
 const assignStock = asyncHandler(async (req, res) => {
   throw AppError.unprocessable(
@@ -220,35 +189,21 @@ const assignStock = asyncHandler(async (req, res) => {
   );
 });
 
-// ─── GET /api/sessions/:id/stock  — cashier inventory for the session owner ─
-
 const getSessionStock = asyncHandler(async (req, res) => {
   const id      = parseId(req.params.id);
-  const session = await resolveSession(id, req);
+  const session = await resolveSession(id, req, db);
 
   const { rows } = await db.query(
-    `SELECT * FROM v_cashier_sim_inventory WHERE cashier_id = $1`,
-    [session.cashier_id]
+    `SELECT quantity FROM sim_balances WHERE owner_type = 'store' AND owner_id = $1`,
+    [session.store_id]
   );
 
-  const r = rows[0];
-  if (!r) {
-    return sendSuccess(res, {
-      available_count: 0,
-      sold_count:      0,
-      next_serial:     null,
-      last_serial:     null,
-      is_low_stock:    true,
-    });
-  }
+  const available_count = rows[0] ? rows[0].quantity : 0;
 
   sendSuccess(res, {
-    available_count: parseInt(r.available_count, 10),
-    sold_count:      parseInt(r.sold_count, 10),
-    voided_count:    parseInt(r.voided_count, 10),
-    next_serial:     r.next_serial,
-    last_serial:     r.last_serial,
-    is_low_stock:    r.is_low_stock,
+    available_count: available_count,
+    sold_count:      0, voided_count: 0, next_serial: null, last_serial: null,
+    is_low_stock:    available_count <= 5,
   });
 });
 

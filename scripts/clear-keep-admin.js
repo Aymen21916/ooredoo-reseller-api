@@ -55,6 +55,8 @@ async function run() {
         daily_reports,
         store_register_state,
         global_pool_state,
+        register_expenses,
+        cashier_advances,
         session_debts,
         session_accessory_sales,
         session_storm_entries,

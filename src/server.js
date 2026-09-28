@@ -25,8 +25,17 @@ const stockRoutes    = require('./routes/stockRoutes');
 const customersRoutes = require('./routes/customersRoutes');
 const advancesRoutes = require('./routes/advancesRoutes');
 const expensesRoutes = require('./routes/expensesRoutes');
+const settingsRoutes = require('./routes/settingsRoutes');
+const storeRoutes = require('./routes/storeRoutes');
+const discountRoutes = require('./routes/discountRoutes');
+const { set } = require('fast-check');
 
 const app = express();
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',  
+  process.env.CORS_ORIGIN 
+];
 
 // ─── Trust Proxy (required behind Nginx/load balancer for correct IP) ────────
 app.set('trust proxy', 1);
@@ -37,8 +46,14 @@ app.use(pinoHttp({ logger }));
 // ─── Security & Utility Middleware ───────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: env.CORS_ORIGIN,
-  credentials: true,
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
 }));
 app.use(express.json({ limit: '100kb' }));
 
@@ -92,6 +107,9 @@ app.use('/api/finances', financesRoutes);
 app.use('/api/stock', stockRoutes);
 app.use('/api/customers', customersRoutes);
 app.use('/api/advances', advancesRoutes);
+app.use('/api/settings', settingsRoutes);
+app.use('/api/stores', storeRoutes);
+app.use('/api/discounts', discountRoutes);
 
 // ─── 404 & Global Error Handling ─────────────────────────────────────────────
 app.use(notFoundHandler);

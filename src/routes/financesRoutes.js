@@ -10,9 +10,14 @@ const router = express.Router();
 // All finance routes require an authenticated admin.
 router.use(authenticate, authorize('admin'));
 
-// ─── Global Pool ────────────────────────────────────────────────────────────
+// ─── Global Pool & Ooredoo Integrations ──────────────────────────────────────
 router.get('/pool', financesController.getPool);
-router.put('/pool', financesController.updatePool);
+router.post('/pool/sync', financesController.syncPoolWithOoredoo);
+router.post('/pool/convert/ussd', financesController.autoConvertPoints); // Trigger *582#
+router.put('/pool', financesController.updatePool); // Manual Recharges/Rewards
+
+// ─── Daily Reconciliation ───────────────────────────────────────────────────
+router.get('/reconciliation/today', financesController.getDailyReconciliation);
 
 // ─── Store Registers ────────────────────────────────────────────────────────
 router.get('/registers', financesController.getRegisters);

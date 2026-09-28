@@ -4,448 +4,337 @@ const db = require('../config/db');
 const AppError = require('../utils/AppError');
 const { asyncHandler, sendCreated, sendSuccess } = require('../utils/asyncHandler');
 const { audit } = require('../utils/audit');
-const {
-  requireFields,
-  parseId,
-  parsePositiveNumber,
-  validateAmount,
-  validateVoidReason,
-} = require('../utils/validators');
+const { requireFields, parseId, parsePositiveNumber, validateAmount, validateVoidReason } = require('../utils/validators');
+const { callOoredooApi } = require('../services/ooredooService');
 
-// ─── HELPER: Assert Session Ownership ────────────────────────────────────────
-
-/** Ensures the session exists, is open, and belongs to the authenticated cashier. */
 const resolveActiveSession = async (sessionId, cashierId, client = db) => {
-  const { rows } = await client.query(
-    `SELECT * FROM cashier_sessions WHERE id = $1`, [sessionId]
-  );
-  
-  const session = rows[0];
-  if (!session) throw AppError.notFound('Session not found.');
-  if (session.cashier_id !== cashierId) throw AppError.forbidden('You do not own this session.');
-  if (session.status !== 'open') throw AppError.conflict('Cannot add sales to a closed session.', 'SESSION_CLOSED');
-  
-  return session;
+  const { rows } = await client.query(`SELECT cs.*, u.store_id FROM cashier_sessions cs JOIN users u ON u.id = cs.cashier_id WHERE cs.id = $1`, [sessionId]);
+  if (!rows[0]) throw AppError.notFound('Session not found.');
+  if (rows[0].cashier_id !== cashierId) throw AppError.forbidden('You do not own this session.');
+  if (rows[0].status !== 'open') throw AppError.conflict('Cannot add sales to a closed session.', 'SESSION_CLOSED');
+  return rows[0];
 };
 
-// ─── POST /api/sales/sim ─────────────────────────────────────────────────────
-// Body: { session_id, offer_id, customer_id }
-// The cashier picks an offer and an existing/new customer (handled by the
-// frontend before calling this endpoint).
+const applyLoyaltyRules = async (client, customerId, type, amountSpent, itemLoyaltyPoints = 0, requestedPointsToRedeem = 0) => {
+  if (!customerId) return { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
+
+  const { rows: sRows } = await client.query('SELECT key, value FROM loyalty_settings');
+  const settings = sRows.reduce((acc, row) => ({ ...acc, [row.key]: parseFloat(row.value) }), {});
+
+  const { rows: cRows } = await client.query(`SELECT * FROM customers WHERE id = $1 FOR UPDATE`, [customerId]);
+  const customer = cRows[0];
+  if (!customer) return { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
+
+  let discountValue = 0; let actualRedeemed = 0;
+  if (requestedPointsToRedeem > 0) {
+    if (customer.available_points < requestedPointsToRedeem) throw AppError.badRequest('Customer does not have enough points.');
+    if (customer.available_points < (settings.min_points_to_redeem || 600)) throw AppError.badRequest(`Need at least ${settings.min_points_to_redeem || 600} points to spend.`);
+    
+    actualRedeemed = requestedPointsToRedeem;
+    discountValue = actualRedeemed * (settings.point_to_dzd_value || 1);
+    if (discountValue > amountSpent) { discountValue = amountSpent; actualRedeemed = discountValue / (settings.point_to_dzd_value || 1); }
+
+    await client.query(`UPDATE customers SET available_points = available_points - $1 WHERE id = $2`, [actualRedeemed, customer.id]);
+    await client.query(`INSERT INTO loyalty_ledger (customer_id, points, transaction_type, description) VALUES ($1, $2, 'spend', 'Redeemed points')`, [customer.id, -actualRedeemed]);
+  }
+
+  let earned = type === 'storm' ? amountSpent * ((settings.storm_earn_percent || 1.0) / 100) : itemLoyaltyPoints;
+  const ledgerEntries = [];
+  if (earned > 0) ledgerEntries.push([earned, 'earn', `Earned from ${type} purchase`]);
+
+  if (amountSpent >= (settings.visit_bonus_min_spend || 500)) {
+    const today = new Date();
+    const lastVisit = customer.last_purchase_at ? new Date(customer.last_purchase_at) : null;
+    if (lastVisit && lastVisit.getMonth() === today.getMonth() && lastVisit.getFullYear() === today.getFullYear() && lastVisit.getDate() !== today.getDate()) {
+      const bonus = settings.visit_bonus_points || 25;
+      earned += bonus;
+      ledgerEntries.push([bonus, 'bonus_visit', 'Same month returning visit bonus']);
+    }
+  }
+
+  if (customer.referred_by && !customer.referral_rewarded && amountSpent > 0) {
+    const refBonus = settings.referral_bonus_points || 25;
+    await client.query(`UPDATE customers SET available_points = available_points + $1, lifetime_points = lifetime_points + $1 WHERE id = $2`, [refBonus, customer.referred_by]);
+    await client.query(`INSERT INTO loyalty_ledger (customer_id, points, transaction_type, description) VALUES ($1, $2, 'bonus_referral', 'Referral bonus unlocked')`, [customer.referred_by, refBonus]);
+    await client.query(`UPDATE customers SET referral_rewarded = TRUE WHERE id = $1`, [customer.id]);
+  }
+
+  if (earned > 0) {
+    await client.query(`UPDATE customers SET available_points = available_points + $1, lifetime_points = lifetime_points + $1 WHERE id = $2`, [earned, customer.id]);
+    for (const [pts, tType, desc] of ledgerEntries) await client.query(`INSERT INTO loyalty_ledger (customer_id, points, transaction_type, description) VALUES ($1, $2, $3, $4)`, [customer.id, pts, tType, desc]);
+  }
+  if (amountSpent > 0) await client.query(`UPDATE customers SET last_purchase_at = NOW() WHERE id = $1`, [customer.id]);
+
+  const { rows: finalCust } = await client.query(`SELECT available_points FROM customers WHERE id = $1`, [customer.id]);
+  const newBalance = finalCust[0] ? parseFloat(finalCust[0].available_points) : 0;
+
+  return { discountValue, pointsEarned: earned, pointsRedeemed: actualRedeemed, newBalance };
+};
 
 const recordSimSale = asyncHandler(async (req, res) => {
-  requireFields(req.body, ['session_id', 'offer_id', 'customer_id']);
-  const sessionId  = parseId(req.body.session_id, 'session_id');
-  const offerId    = parseId(req.body.offer_id, 'offer_id');
-  const customerId = parseId(req.body.customer_id, 'customer_id');
+  requireFields(req.body, ['session_id', 'offer_id']);
+  const sessionId = parseId(req.body.session_id, 'session_id');
+  const offerId = parseId(req.body.offer_id, 'offer_id');
+  const customerId = req.body.customer_id ? parseId(req.body.customer_id, 'customer_id') : null;
+  const discountAmount = req.body.discount_amount ? parseFloat(req.body.discount_amount) : 0;
+  const requestedPointsToRedeem = req.body.points_redeemed ? parseFloat(req.body.points_redeemed) : 0;
+  
+  if (discountAmount < 0) throw AppError.badRequest('Discount cannot be negative.');
 
   const result = await db.withTransaction(async (client) => {
-    await resolveActiveSession(sessionId, req.user.id, client);
-
-    // 1. Verify customer exists
-    const { rows: customerRows } = await client.query(
-      `SELECT id, first_name, last_name FROM customers WHERE id = $1`,
-      [customerId]
+    const session = await resolveActiveSession(sessionId, req.user.id, client);
+    
+    const { rows: stockRows } = await client.query(
+      `UPDATE sim_balances 
+       SET quantity = quantity - 1
+       WHERE owner_type = 'store' AND owner_id = $1 AND quantity > 0
+       RETURNING quantity`,
+      [session.store_id]
     );
-    if (!customerRows[0]) throw AppError.notFound('Customer not found.');
 
-    // 2. Verify offer exists and grab snapshot data
-    const { rows: offerRows } = await client.query(
-      `SELECT name, real_price, selling_price, points, commission_amount, is_active
-       FROM offers WHERE id = $1 FOR SHARE`,
-      [offerId]
-    );
-    const offer = offerRows[0];
-    if (!offer) throw AppError.notFound('Offer not found.');
-    if (!offer.is_active) throw AppError.badRequest('This offer is currently inactive.');
-
-    // 3. Pull the next available SIM card for this cashier (FIFO by serial).
-    //    SIM cards are generic — the offer is decided at sale time.
-    //    FOR UPDATE SKIP LOCKED prevents two concurrent sales from grabbing
-    //    the same card.
-    const { rows: cardRows } = await client.query(
-      `SELECT id, serial_number
-       FROM sim_cards
-       WHERE cashier_id = $1 AND status = 'available'
-       ORDER BY serial_number
-       LIMIT 1 FOR UPDATE SKIP LOCKED`,
-      [req.user.id]
-    );
-    const card = cardRows[0];
-    if (!card) {
-      throw AppError.conflict(
-        'No available SIM cards in your inventory. Ask the admin to assign more.',
-        'OUT_OF_STOCK'
-      );
+    if (!stockRows[0]) {
+      throw AppError.conflict('Out of stock. You do not have any SIM cards assigned to you.', 'OUT_OF_STOCK');
     }
 
-    // 4. Mark the card as sold
-    await client.query(
-      `UPDATE sim_cards SET status = 'sold', sold_at = NOW() WHERE id = $1`,
-      [card.id]
-    );
+    let customerName = 'Walk-in Customer';
+    if (customerId) {
+      const { rows: cRows } = await client.query(`SELECT id, first_name, last_name FROM customers WHERE id = $1`, [customerId]);
+      if (!cRows[0]) throw AppError.notFound('Customer not found.');
+      customerName = `${cRows[0].first_name} ${cRows[0].last_name}`;
+    }
 
-    // 5. Insert the sale with snapshotted prices, the consumed serial, and customer
+    const { rows: offerRows } = await client.query(`SELECT name, real_price, selling_price, commission_points, loyalty_points, commission_amount, is_active FROM offers WHERE id = $1 FOR SHARE`, [offerId]);
+    if (!offerRows[0]) throw AppError.notFound('Offer not found.');
+
+    const offer = offerRows[0];
+    
+    const maxDiscountAllowed = Number(offer.selling_price) + Number(offer.commission_points) - Number(offer.real_price);
+    
+    if (discountAmount > maxDiscountAllowed) {
+      throw AppError.badRequest(`Discount too large! The maximum manual discount allowed is ${maxDiscountAllowed} DA to avoid selling at a loss.`, 'EXCESSIVE_DISCOUNT');
+    }
+
+    const baseSellingPrice = offer.selling_price - discountAmount;
+    const { discountValue, pointsEarned, pointsRedeemed, newBalance } = customerId ? await applyLoyaltyRules(client, customerId, 'sim', baseSellingPrice, offer.loyalty_points, requestedPointsToRedeem) : { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
+    const finalPaidCash = baseSellingPrice - discountValue;
+    
     const { rows } = await client.query(
-      `INSERT INTO session_sim_sales
-        (session_id, offer_id, customer_id, sim_card_id, serial_number_snapshot,
-         offer_name_snapshot, real_price_snapshot,
-         selling_price_snapshot, points_snapshot, commission_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       RETURNING *`,
-      [
-        sessionId, offerId, customerId, card.id, card.serial_number,
-        offer.name, offer.real_price, offer.selling_price,
-        offer.points, offer.commission_amount,
-      ]
+      `INSERT INTO session_sim_sales (session_id, offer_id, customer_id, offer_name_snapshot, real_price_snapshot, selling_price_snapshot, discount_snapshot, commission_points_snapshot, commission_snapshot, loyalty_earned_snapshot, loyalty_redeemed_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [sessionId, offerId, customerId, offer.name, offer.real_price, baseSellingPrice, discountAmount, offer.commission_points, offer.commission_amount, pointsEarned, pointsRedeemed]
     );
 
-    audit({
-      userId:    req.user.id,
-      action:    'INSERT',
-      table:     'session_sim_sales',
-      recordId:  rows[0].id,
-      newValues: { serial_number: card.serial_number, offer_id: offerId, customer_id: customerId },
-      ip:        req.clientIp,
-    });
-
-    return {
-      ...rows[0],
-      customer_name: `${customerRows[0].first_name} ${customerRows[0].last_name}`,
+    const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';
+    
+    return { 
+      ...rows[0], type: 'sim', description: offer.name + descExtra, 
+      created_at: rows[0].sold_at, 
+      amount: finalPaidCash, 
+      customer_name: customerName,
+      points_earned: pointsEarned, points_redeemed: pointsRedeemed, new_points_balance: newBalance 
     };
   });
 
-  sendCreated(res, result, 'SIM sale recorded.');
+  sendCreated(res, result, 'SIM sale recorded successfully.');
 });
-
-// ─── POST /api/sales/storm ───────────────────────────────────────────────────
 
 const recordStormEntry = asyncHandler(async (req, res) => {
-  requireFields(req.body, ['session_id', 'amount', 'customer_id']);
-  const sessionId  = parseId(req.body.session_id, 'session_id');
-  const customerId = parseId(req.body.customer_id, 'customer_id');
-  const amount     = parsePositiveNumber(req.body.amount, 'amount');
-  const note       = req.body.note ? String(req.body.note).trim().slice(0, 500) : null;
+  requireFields(req.body, ['session_id', 'amount']);
+  const sessionId = parseId(req.body.session_id, 'session_id');
+  const amount = parsePositiveNumber(req.body.amount, 'amount');
+  const requestedPointsToRedeem = req.body.points_redeemed ? parseFloat(req.body.points_redeemed) : 0;
+  const customerId = req.body.customer_id ? parseId(req.body.customer_id, 'customer_id') : null;
+  const note = req.body.note ? String(req.body.note).trim().slice(0, 500) : (req.body.phone_number ? req.body.phone_number : null);
 
-  const { rows } = await db.withTransaction(async (client) => {
-    await resolveActiveSession(sessionId, req.user.id, client);
-
-    const { rows: customerRows } = await client.query(
-      `SELECT id FROM customers WHERE id = $1`, [customerId]
-    );
-    if (!customerRows[0]) throw AppError.notFound('Customer not found.');
-
-    return client.query(
-      `INSERT INTO session_storm_entries (session_id, customer_id, amount, note)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [sessionId, customerId, amount, note]
-    );
-  });
-
-  audit({ userId: req.user.id, action: 'INSERT', table: 'session_storm_entries', recordId: rows[0].id, ip: req.clientIp });
-  sendCreated(res, rows[0], 'Storm entry recorded.');
-});
-
-// ─── POST /api/sales/accessory ───────────────────────────────────────────────
-
-const recordAccessorySale = asyncHandler(async (req, res) => {
-  requireFields(req.body, ['session_id', 'product_id', 'customer_id']);
-  const sessionId  = parseId(req.body.session_id, 'session_id');
-  const productId  = parseId(req.body.product_id, 'product_id');
-  const customerId = parseId(req.body.customer_id, 'customer_id');
+  const discountAmount = req.body.discount_amount ? parseFloat(req.body.discount_amount) : 0;
+  if (discountAmount < 0) throw AppError.badRequest('Discount cannot be negative.');
 
   const result = await db.withTransaction(async (client) => {
-    await resolveActiveSession(sessionId, req.user.id, client);
+    const session = await resolveActiveSession(sessionId, req.user.id, client);
+    
+    const baseSellingPrice = amount - discountAmount;
+    if (baseSellingPrice < 0) throw AppError.badRequest('Discount cannot exceed the storm amount.');
 
-    const { rows: customerRows } = await client.query(
-      `SELECT id FROM customers WHERE id = $1`, [customerId]
-    );
-    if (!customerRows[0]) throw AppError.notFound('Customer not found.');
-
-    const { rows: prodRows } = await client.query(
-      `SELECT p.name as product_name, p.price, p.real_price, p.commission_amount, p.is_active, pc.name as category_name
-       FROM products p
-       JOIN product_categories pc ON pc.id = p.category_id
-       WHERE p.id = $1`,
-      [productId]
-    );
-    const prod = prodRows[0];
-    if (!prod) throw AppError.notFound('Product not found.');
-    if (!prod.is_active) throw AppError.badRequest('Product is inactive.');
-
+    const { discountValue, pointsEarned, pointsRedeemed, newBalance } = customerId ? await applyLoyaltyRules(client, customerId, 'storm', baseSellingPrice, 0, requestedPointsToRedeem) : { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
+    
     const { rows } = await client.query(
-      `INSERT INTO session_accessory_sales
-        (session_id, product_id, customer_id, product_name_snapshot, category_name_snapshot,
-         price_snapshot, real_price_snapshot, commission_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING *`,
-      [sessionId, productId, customerId, prod.product_name, prod.category_name,
-       prod.price, prod.real_price, prod.commission_amount]
+      `INSERT INTO session_storm_entries (session_id, customer_id, amount, note, loyalty_earned_snapshot, loyalty_redeemed_snapshot) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [sessionId, customerId, baseSellingPrice, note ? note + ` (Orig: ${amount})` : `Orig: ${amount}`, pointsEarned, pointsRedeemed]
     );
-    return rows[0];
+
+    const finalPaidCash = baseSellingPrice - discountValue;
+    
+    const baseDesc = rows[0].note || 'Storm / Bundle';
+    const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';
+    
+    return { 
+      ...rows[0], type: 'storm', description: baseDesc + descExtra, 
+      created_at: rows[0].entered_at, 
+      amount: finalPaidCash, 
+      points_earned: pointsEarned, points_redeemed: pointsRedeemed, new_points_balance: newBalance 
+    };
   });
 
-  audit({ userId: req.user.id, action: 'INSERT', table: 'session_accessory_sales', recordId: result.id, ip: req.clientIp });
+  sendCreated(res, result, 'Storm entry recorded.');
+});
+
+const recordAccessorySale = asyncHandler(async (req, res) => {
+  requireFields(req.body, ['session_id', 'product_id']);
+  const sessionId = parseId(req.body.session_id, 'session_id');
+  const productId = parseId(req.body.product_id, 'product_id');
+  const customerId = req.body.customer_id ? parseId(req.body.customer_id, 'customer_id') : null;
+  const requestedPointsToRedeem = req.body.points_redeemed ? parseFloat(req.body.points_redeemed) : 0;
+  
+  const discountAmount = req.body.discount_amount ? parseFloat(req.body.discount_amount) : 0;
+  if (discountAmount < 0) throw AppError.badRequest('Discount cannot be negative.');
+
+  const result = await db.withTransaction(async (client) => {
+    const session = await resolveActiveSession(sessionId, req.user.id, client);
+    const { rows: prodRows } = await client.query(`SELECT p.name as product_name, p.price, p.real_price, COALESCE(p.loyalty_points, 0) as loyalty_points, p.commission_amount, pc.name as category_name FROM products p JOIN product_categories pc ON pc.id = p.category_id WHERE p.id = $1`, [productId]);
+    if (!prodRows[0]) throw AppError.notFound('Product not found.');
+
+    const product = prodRows[0];
+
+    const maxDiscountAllowed = Number(product.price) - Number(product.real_price);
+    
+    if (discountAmount > maxDiscountAllowed) {
+      throw AppError.badRequest(`Discount too large! The maximum manual discount allowed is ${maxDiscountAllowed} DA to avoid selling at a loss.`, 'EXCESSIVE_DISCOUNT');
+    }
+
+    const baseSellingPrice = product.price - discountAmount;
+
+    const { discountValue, pointsEarned, pointsRedeemed, newBalance } = customerId ? await applyLoyaltyRules(client, customerId, 'accessory', baseSellingPrice, product.loyalty_points, requestedPointsToRedeem) : { discountValue: 0, pointsEarned: 0, pointsRedeemed: 0, newBalance: 0 };
+    
+    const { rows } = await client.query(
+      `INSERT INTO session_accessory_sales (session_id, product_id, customer_id, product_name_snapshot, category_name_snapshot, price_snapshot, real_price_snapshot, commission_snapshot, loyalty_earned_snapshot, loyalty_redeemed_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [sessionId, productId, customerId, product.product_name, product.category_name, baseSellingPrice, product.real_price, product.commission_amount, pointsEarned, pointsRedeemed]
+    );
+
+    const finalPaidCash = baseSellingPrice - discountValue;
+    
+    const descExtra = pointsRedeemed > 0 ? ' (Loyalty Discount)' : '';
+    
+    return { 
+      ...rows[0], type: 'accessory', description: product.product_name + descExtra, 
+      created_at: rows[0].sold_at, 
+      amount: finalPaidCash,
+      points_earned: pointsEarned, points_redeemed: pointsRedeemed, new_points_balance: newBalance 
+    };
+  });
+
   sendCreated(res, result, 'Accessory sale recorded.');
 });
 
-// ─── POST /api/sales/debt ────────────────────────────────────────────────────
-// Body: { session_id?, customer_id?, phone_number?, amount, description? }
-//
-// Customer link is mandatory (Req 1.7, 1.8, 1.10): the caller MUST supply
-// either `customer_id` or, for the existing-customer-by-phone path used by
-// the new debt modal, a `phone_number` that resolves to an existing
-// customer. Sending neither yields `CUSTOMER_REQUIRED` (HTTP 400).
-//
-// We re-validate the cashier's open session here (rather than reusing
-// `resolveActiveSession`) so any session-state failure surfaces as the
-// NO_OPEN_SESSION (HTTP 400) error code mandated by Req 1.6.
-
 const recordDebt = asyncHandler(async (req, res) => {
-  // ── 1. Mandatory customer link ─────────────────────────────────────────
-  const rawCustomerId  = req.body.customer_id;
+  requireFields(req.body, ['session_id', 'amount']);
+  const sessionId = parseId(req.body.session_id, 'session_id');
+  const rawCustomerId = req.body.customer_id;
   const rawPhoneNumber = req.body.phone_number;
-  const hasCustomerId  =
-    rawCustomerId !== undefined && rawCustomerId !== null && rawCustomerId !== '';
-  const hasPhone       =
-    typeof rawPhoneNumber === 'string' && rawPhoneNumber.trim().length > 0;
 
-  if (!hasCustomerId && !hasPhone) {
-    throw AppError.badRequest(
-      'A linked customer is required for every debt.',
-      'CUSTOMER_REQUIRED'
-    );
-  }
-
-  // ── 2. Amount + optional description (post-trim, length-bounded) ──────
-  const amount = validateAmount(req.body.amount, {
-    min: 0.01,
-    max: 9999999999.99,
-    decimals_allowed: 2,
-    fieldName: 'amount',
-  });
-
-  let description = null;
-  if (req.body.description !== undefined && req.body.description !== null) {
-    if (typeof req.body.description !== 'string') {
-      throw AppError.badRequest(
-        '"description" must be a string of at most 1000 characters.',
-        'VALIDATION_ERROR'
-      );
-    }
-    const trimmed = req.body.description.trim();
-    if (trimmed.length > 1000) {
-      throw AppError.badRequest(
-        '"description" must be at most 1000 characters after trimming.',
-        'VALIDATION_ERROR'
-      );
-    }
-    description = trimmed.length === 0 ? null : trimmed;
-  }
+  if (!rawCustomerId && !rawPhoneNumber) throw AppError.badRequest('A linked customer is required for every debt.', 'CUSTOMER_REQUIRED');
+  const amount = validateAmount(req.body.amount, { min: 0.01, max: 9999999999.99, decimals_allowed: 2, fieldName: 'amount' });
+  let description = req.body.description ? String(req.body.description).trim().slice(0, 1000) : null;
 
   const result = await db.withTransaction(async (client) => {
-    // ── 3. Cashier MUST have exactly one open session ───────────────────
-    const { rows: sessionRows } = await client.query(
-      `SELECT id FROM cashier_sessions
-        WHERE cashier_id = $1 AND status = 'open'
-        ORDER BY id DESC
-        LIMIT 1`,
-      [req.user.id]
-    );
-    const openSession = sessionRows[0];
-    if (!openSession) {
-      throw AppError.badRequest(
-        'You have no open cashier session.',
-        'NO_OPEN_SESSION'
-      );
-    }
-
-    // If the client passed a session_id, it must match the cashier's open
-    // one. Any mismatch (closed, foreign, non-existent) is treated as the
-    // same NO_OPEN_SESSION condition per Req 1.6.
-    if (req.body.session_id !== undefined && req.body.session_id !== null && req.body.session_id !== '') {
-      const claimed = parseId(req.body.session_id, 'session_id');
-      if (claimed !== openSession.id) {
-        throw AppError.badRequest(
-          'You have no open cashier session.',
-          'NO_OPEN_SESSION'
-        );
-      }
-    }
-
-    // ── 4. Resolve the linked customer ──────────────────────────────────
-    // Prefer customer_id when supplied; otherwise fall back to phone-only
-    // resolution (existing-customer path from the modal).
+    const session = await resolveActiveSession(sessionId, req.user.id, client);
     let customer = null;
-
-    if (hasCustomerId) {
-      const customerId = parseId(rawCustomerId, 'customer_id');
-      const { rows } = await client.query(
-        `SELECT id, first_name, last_name FROM customers WHERE id = $1`,
-        [customerId]
-      );
+    if (rawCustomerId) {
+      const { rows } = await client.query(`SELECT id, first_name, last_name FROM customers WHERE id = $1`, [parseId(rawCustomerId, 'customer_id')]);
       customer = rows[0] || null;
     } else {
-      // Phone-only payload — re-use existing record rather than create a
-      // duplicate (Req 1.4). Defer creation flow to the dedicated
-      // `customersController.createCustomer` endpoint.
-      const phone = rawPhoneNumber.trim();
-      const { rows } = await client.query(
-        `SELECT id, first_name, last_name FROM customers WHERE phone_number = $1`,
-        [phone]
-      );
+      const { rows } = await client.query(`SELECT id, first_name, last_name FROM customers WHERE phone_number = $1`, [rawPhoneNumber.trim()]);
       customer = rows[0] || null;
     }
+    if (!customer) throw AppError.notFound('Customer not found.', 'CUSTOMER_NOT_FOUND');
 
-    if (!customer) {
-      throw AppError.notFound('Customer not found.', 'CUSTOMER_NOT_FOUND');
-    }
-
-    // ── 5. Insert the debt row ──────────────────────────────────────────
-    const { rows: insertRows } = await client.query(
-      `INSERT INTO session_debts (session_id, customer_id, amount, description)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [openSession.id, customer.id, amount, description]
-    );
-    const debtRow = insertRows[0];
-
-    return {
-      ...debtRow,
-      customer_name: `${customer.first_name} ${customer.last_name}`,
-    };
-  });
-
-  // ── 6. Fire-and-forget audit log (Req 1.14) ──────────────────────────
-  audit({
-    userId:    req.user.id,
-    action:    'INSERT',
-    table:     'session_debts',
-    recordId:  result.id,
-    newValues: {
-      customer_id: result.customer_id,
-      session_id:  result.session_id,
-      amount:      result.amount,
-    },
-    ip:        req.clientIp,
+    const { rows: insertRows } = await client.query(`INSERT INTO session_debts (session_id, customer_id, amount, description) VALUES ($1, $2, $3, $4) RETURNING *`, [session.id, customer.id, amount, description]);
+    return { ...insertRows[0], type: 'debt', description: insertRows[0].description || 'Client Debt', created_at: insertRows[0].entered_at, customer_name: `${customer.first_name} ${customer.last_name}` };
   });
 
   sendCreated(res, result, 'Debt recorded.');
 });
 
-// Add this new function to fetch history
 const getSessionHistory = asyncHandler(async (req, res) => {
   const sessionId = req.params.sessionId;
+  
+  const { rows: sRows } = await db.query("SELECT value FROM loyalty_settings WHERE key = 'point_to_dzd_value'");
+  const ptVal = sRows[0] ? parseFloat(sRows[0].value) : 1;
 
-  // Use a UNION ALL to combine all 4 sales tables into one chronological feed
   const { rows } = await db.query(`
-    SELECT 'sim' as type, id, offer_name_snapshot as description, selling_price_snapshot as amount, sold_at AS created_at, is_voided
+    SELECT 'sim' as type, id, 
+           offer_name_snapshot as description, 
+           (selling_price_snapshot - (COALESCE(loyalty_redeemed_snapshot, 0) * $2)) as amount,
+           COALESCE(loyalty_earned_snapshot, 0) as points_earned,
+           COALESCE(loyalty_redeemed_snapshot, 0) as points_redeemed, 
+           sold_at AS created_at, is_voided 
     FROM session_sim_sales WHERE session_id = $1
-    UNION ALL
-    SELECT 'storm' as type, id, COALESCE(note, 'Storm / Bundle') as description, amount, entered_at AS created_at, is_voided
+    
+    UNION ALL 
+    
+    SELECT 'storm' as type, id, 
+           COALESCE(note, 'Storm / Bundle') as description, 
+           (amount - (COALESCE(loyalty_redeemed_snapshot, 0) * $2)) as amount,
+           COALESCE(loyalty_earned_snapshot, 0) as points_earned,
+           COALESCE(loyalty_redeemed_snapshot, 0) as points_redeemed, 
+           entered_at AS created_at, is_voided 
     FROM session_storm_entries WHERE session_id = $1
-    UNION ALL
-    SELECT 'accessory' as type, id, product_name_snapshot as description, price_snapshot as amount, sold_at AS created_at, is_voided
+    
+    UNION ALL 
+    
+    SELECT 'accessory' as type, id, 
+           product_name_snapshot as description, 
+           (price_snapshot - (COALESCE(loyalty_redeemed_snapshot, 0) * $2)) as amount,
+           COALESCE(loyalty_earned_snapshot, 0) as points_earned,
+           COALESCE(loyalty_redeemed_snapshot, 0) as points_redeemed, 
+           sold_at AS created_at, is_voided 
     FROM session_accessory_sales WHERE session_id = $1
-    UNION ALL
-    SELECT 'debt' as type, id, COALESCE(description, 'Client Debt') as description, amount, entered_at AS created_at, is_voided
+    
+    UNION ALL 
+    
+    SELECT 'debt' as type, id, COALESCE(description, 'Client Debt') as description, amount, 0 as points_earned, 0 as points_redeemed, entered_at AS created_at, is_voided 
     FROM session_debts WHERE session_id = $1
     ORDER BY created_at DESC
-    LIMIT 50
-  `, [sessionId]);
-
+  `, [sessionId, ptVal]);
   res.json({ success: true, data: rows });
 });
 
-// Void a transaction with ownership check, full void metadata, and audit.
-//
-// For debt rows (Req 1.13, 1.14):
-//   - The customer link on `session_debts.customer_id` is preserved by
-//     simply not touching that column during the soft-void update — the
-//     audit row records it under `old_values` so the link is reconstructible.
-//   - Already-voided rows are rejected with HTTP 409 / `ALREADY_VOIDED`.
-//   - `void_reason` is validated through the shared helper, which emits
-//     `MISSING_VOID_REASON` (when absent) or `INVALID_VOID_REASON` (when
-//     present but malformed/out-of-bounds).
 const voidTransaction = asyncHandler(async (req, res) => {
   const { type, id } = req.params;
-  const tableMap = {
-    sim: 'session_sim_sales',
-    storm: 'session_storm_entries',
-    accessory: 'session_accessory_sales',
-    debt: 'session_debts',
-  };
+  const tableMap = { sim: 'session_sim_sales', storm: 'session_storm_entries', accessory: 'session_accessory_sales', debt: 'session_debts' };
   const table = tableMap[type];
   if (!table) throw AppError.badRequest('Invalid transaction type.', 'VALIDATION_ERROR');
-
   const transactionId = parseId(id, 'id');
-
-  // Validate void_reason via the shared helper (1..500 chars after trim).
   const reason = validateVoidReason(req.body && req.body.reason);
 
-  // Pull the row first WITHOUT the is_voided filter so we can distinguish
-  // "row not found" (404) from "row exists but already voided" (409).
-  // We also widen the projection so the debt path can carry `customer_id`
-  // into the audit log without an extra query.
-  const extraSelect =
-    type === 'sim'  ? ', t.sim_card_id'
-  : type === 'debt' ? ', t.customer_id, t.amount'
-  : '';
+  const { rows: sRows } = await db.query("SELECT value FROM loyalty_settings WHERE key = 'point_to_dzd_value'");
+  const ptVal = sRows[0] ? parseFloat(sRows[0].value) : 1;
 
-  const oldValues = await db.withTransaction(async (client) => {
-    const { rows } = await client.query(
-      `SELECT t.id, t.session_id, t.is_voided, cs.cashier_id${extraSelect}
-         FROM ${table} t
-         JOIN cashier_sessions cs ON cs.id = t.session_id
-        WHERE t.id = $1`,
-      [transactionId]
-    );
+  await db.withTransaction(async (client) => {
+    const { rows } = await client.query(`SELECT t.*, cs.cashier_id, u.store_id FROM ${table} t JOIN cashier_sessions cs ON cs.id = t.session_id JOIN users u ON u.id = cs.cashier_id WHERE t.id = $1 FOR UPDATE`, [transactionId]);
     const row = rows[0];
     if (!row) throw AppError.notFound('Transaction not found.');
-    if (row.cashier_id !== req.user.id) throw AppError.forbidden('Not your transaction.');
-    if (row.is_voided) {
-      throw AppError.conflict('Transaction is already voided.', 'ALREADY_VOIDED');
+    if (row.is_voided) throw AppError.conflict('Transaction is already voided.', 'ALREADY_VOIDED');
+
+    await client.query(`UPDATE ${table} SET is_voided = TRUE, voided_at = NOW(), voided_by = $1, void_reason = $2 WHERE id = $3`, [req.user.id, reason, transactionId]);
+
+    if (type !== 'debt' && row.customer_id) {
+      const earned = parseFloat(row.loyalty_earned_snapshot || 0);
+      const redeemed = parseFloat(row.loyalty_redeemed_snapshot || 0);
+      if (earned > 0 || redeemed > 0) {
+        await client.query(`UPDATE customers SET available_points = available_points - $1 + $2 WHERE id = $3`, [earned, redeemed, row.customer_id]);
+        if (earned > 0) await client.query(`UPDATE customers SET lifetime_points = GREATEST(lifetime_points - $1, 0) WHERE id = $2`, [earned, row.customer_id]);
+        await client.query(`INSERT INTO loyalty_ledger (customer_id, points, transaction_type, description) VALUES ($1, $2, 'void_reversal', 'Reversal for voided transaction')`, [row.customer_id, redeemed - earned]);
+      }
     }
-
-    await client.query(
-      `UPDATE ${table}
-          SET is_voided = TRUE, voided_at = NOW(),
-              voided_by = $1, void_reason = $2
-        WHERE id = $3`,
-      [req.user.id, reason, transactionId]
-    );
-
-    // If we're voiding a SIM sale, return the physical card to inventory
-    if (type === 'sim' && row.sim_card_id) {
-      await client.query(
-        `UPDATE sim_cards SET status = 'available', sold_at = NULL WHERE id = $1`,
-        [row.sim_card_id]
-      );
-    }
-
-    // Build the audit `old_values` payload with whatever identifying
-    // fields we projected for this transaction type. For debts this
-    // includes `customer_id` per Req 1.14.
-    const payload = { session_id: row.session_id };
-    if (type === 'debt') {
-      payload.customer_id = row.customer_id;
-      payload.amount      = row.amount;
-    }
-    return payload;
-  });
-
-  audit({
-    userId:    req.user.id,
-    action:    'VOID',
-    table,
-    recordId:  transactionId,
-    oldValues,
-    ip:        req.clientIp,
   });
 
   sendSuccess(res, null, 200, 'Transaction voided.');
 });
 
-// Don't forget to export them at the bottom!
-module.exports = { recordSimSale, recordStormEntry, recordAccessorySale, recordDebt, getSessionHistory, voidTransaction };
+const proxyNbservice = asyncHandler(async (req, res) => {
+  try {
+    const response = await callOoredooApi(req.body);
+    res.status(response.status).json(response.data);
+  } catch (error) { throw AppError.internal('Failed to reach Ooredoo USSD service: ' + error.message); }
+});
+
+module.exports = { recordSimSale, recordStormEntry, recordAccessorySale, recordDebt, getSessionHistory, voidTransaction, proxyNbservice };

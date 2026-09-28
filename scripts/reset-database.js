@@ -41,13 +41,10 @@ async function run() {
     await client.query('BEGIN');
 
     // 1. TRUNCATE all data tables in dependency-safe order via CASCADE.
-    //    audit_logs has FKs to users, so wipe data first then reseed admin.
-    //    daily_reports is normally immutable; we explicitly drop the trigger
-    //    for this single reset, then restore it.
-    console.log('• Dropping daily-reports immutability trigger…');
-    await client.query(`
-      DROP TRIGGER IF EXISTS trg_protect_daily_reports_delete ON daily_reports
-    `);
+    console.log('• Dropping immutability triggers…');
+    await client.query(`DROP TRIGGER IF EXISTS trg_protect_daily_reports_delete ON daily_reports`);
+    await client.query(`DROP TRIGGER IF EXISTS trg_protect_daily_reports_update ON daily_reports`);
+    await client.query(`DROP TRIGGER IF EXISTS trg_protect_audit_logs ON audit_logs`);
 
     console.log('• Truncating tables…');
     await client.query(`
@@ -56,6 +53,8 @@ async function run() {
         daily_reports,
         store_register_state,
         global_pool_state,
+        register_expenses,
+        cashier_advances,
         session_debts,
         session_accessory_sales,
         session_storm_entries,
@@ -73,11 +72,21 @@ async function run() {
       RESTART IDENTITY CASCADE
     `);
 
-    console.log('• Restoring immutability trigger…');
+    console.log('• Restoring immutability triggers…');
     await client.query(`
       CREATE TRIGGER trg_protect_daily_reports_delete
         BEFORE DELETE ON daily_reports
         FOR EACH ROW EXECUTE FUNCTION fn_protect_daily_reports()
+    `);
+    await client.query(`
+      CREATE TRIGGER trg_protect_daily_reports_update
+        BEFORE UPDATE ON daily_reports
+        FOR EACH ROW EXECUTE FUNCTION fn_protect_daily_reports_update()
+    `);
+    await client.query(`
+      CREATE TRIGGER trg_protect_audit_logs
+        BEFORE UPDATE OR DELETE ON audit_logs
+        FOR EACH ROW EXECUTE FUNCTION fn_protect_audit_logs()
     `);
 
     // 2. Seed stores

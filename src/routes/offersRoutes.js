@@ -22,5 +22,7 @@ router.patch('/:id', authorize('admin'), offersController.updateOffer);
 router.delete('/:id', authorize('admin'), offersController.deleteOffer);
 router.post('/:id/restore', authorize('admin'), offersController.restoreOffer);
 router.delete('/:id/permanent', authorize('admin'), offersController.permanentDeleteOffer);
+router.post('/categories',authorize('admin'), offersController.createCategory);
+router.delete('/categories/:id', authorize('admin'), offersController.deleteCategory);
 
 module.exports = router;

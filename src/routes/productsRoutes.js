@@ -4,26 +4,27 @@ const express = require('express');
 const productsController = require('../controllers/productsController');
 const { authenticate } = require('../middleware/authenticate');
 const { authorize } = require('../middleware/authorize');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
 
 const router = express.Router();
 
-// ─── Protected Routes ────────────────────────────────────────────────────────
 router.use(authenticate);
 
-// ─── Shared Routes (Admin & Cashier) ─────────────────────────────────────────
-
-// Get all product categories (must be defined before /:id)
+// ─── Category Routes ─────────────────────────────────────────────────────────
 router.get('/categories', productsController.listCategories);
+router.post('/categories', authorize('admin'), productsController.createCategory);
+router.put('/categories/:id', authorize('admin'), productsController.updateCategory);
+router.delete('/categories/:id', authorize('admin'), productsController.deleteCategory);
 
-// Cashiers only see active products; Admins see all. Supports ?category=id filtering.
+// ─── Product Routes ──────────────────────────────────────────────────────────
 router.get('/', productsController.listProducts);
 router.get('/:id', productsController.getProduct);
 
-// ─── Admin-Only Routes ───────────────────────────────────────────────────────
 router.post('/', authorize('admin'), productsController.createProduct);
 router.patch('/:id', authorize('admin'), productsController.updateProduct);
 router.delete('/:id', authorize('admin'), productsController.deleteProduct);
-router.post('/:id/restore', authorize('admin'), productsController.restoreProduct);
-router.delete('/:id/permanent', authorize('admin'), productsController.permanentDeleteProduct);
+
+router.post('/bulk-upload', upload.single('file'), productsController.bulkUpload);
 
 module.exports = router;
