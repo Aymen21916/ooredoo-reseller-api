@@ -10,7 +10,7 @@ const httpsAgent = new https.Agent({ rejectUnauthorized: false, family: 4 });
 const performOoredooLogin = async () => {
   console.log('[Ooredoo Service] Generating new session cookie...');
   const loginPayload = {
-    app_id: "ussd_app", username: "0557891148", password: "7241",       
+    app_id: "ussd_app", username: "0000000000", password: "0000",       
     isdevice: false, device: false, lang: null, app_revision: null,
   };
 
